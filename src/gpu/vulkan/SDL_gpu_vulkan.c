@@ -72,6 +72,25 @@ typedef struct VulkanExtensions
 #define DESCRIPTOR_POOL_SIZE          128
 #define WINDOW_PROPERTY_DATA          "SDL.internal.gpu.vulkan.data"
 
+/* DIAGNOSTIC (ClassicUO page-fault investigation), not for shipping.
+ * CUO_SDL_VARIANT: unset/"stock" = stock allocator; "dedicated" = images >= 64 MiB get a dedicated
+ * allocation; "refguard" = defrag skips allocations holding a resource with referenceCount > 0;
+ * "nodefrag" = no marking and no defragmentation. Defrag moves are logged as "SDL diag: defrag". */
+#define CUO_VAR_STOCK     0
+#define CUO_VAR_DEDICATED 1
+#define CUO_VAR_REFGUARD  2
+#define CUO_VAR_NODEFRAG  3
+static int CUO_Variant(void)
+{
+    static int variant = -1;
+    if (variant < 0) {
+        const char *v = SDL_getenv_unsafe("CUO_SDL_VARIANT");
+        variant = !v ? CUO_VAR_STOCK : SDL_strcmp(v, "dedicated") == 0 ? CUO_VAR_DEDICATED : SDL_strcmp(v, "refguard") == 0 ? CUO_VAR_REFGUARD : SDL_strcmp(v, "nodefrag") == 0 ? CUO_VAR_NODEFRAG : CUO_VAR_STOCK;
+        SDL_Log("SDL diagnostic build v2: variant=%s", variant == CUO_VAR_DEDICATED ? "dedicated" : variant == CUO_VAR_REFGUARD ? "refguard" : variant == CUO_VAR_NODEFRAG ? "nodefrag" : "stock");
+    }
+    return variant;
+}
+
 #define IDENTITY_SWIZZLE               \
     {                                  \
         VK_COMPONENT_SWIZZLE_IDENTITY, \
@@ -2076,7 +2095,8 @@ static Uint8 VULKAN_INTERNAL_BindResourceMemory(
         // No suitable free regions exist, allocate a new memory region
         if (
             renderer->allocationsToDefragCount == 0 &&
-            !renderer->defragInProgress) {
+            !renderer->defragInProgress &&
+            CUO_Variant() != CUO_VAR_NODEFRAG) {
             // Mark currently fragmented allocations for defrag
             VULKAN_INTERNAL_MarkAllocationsForDefrag(renderer);
         }
@@ -2199,7 +2219,7 @@ static Uint8 VULKAN_INTERNAL_BindMemoryForImage(
             memoryTypesToTry[i],
             &memoryRequirements,
             memoryRequirements.size,
-            false,
+            CUO_Variant() == CUO_VAR_DEDICATED && memoryRequirements.size >= LARGE_ALLOCATION_INCREMENT,
             VK_NULL_HANDLE,
             image,
             usedRegion);
@@ -10814,7 +10834,7 @@ static bool VULKAN_Submit(
             swapchainTextureSubresource);
     }
 
-    if (performCleanups &&
+    if (performCleanups && CUO_Variant() != CUO_VAR_NODEFRAG &&
         renderer->allocationsToDefragCount > 0 &&
         !renderer->defragInProgress) {
         if (!VULKAN_INTERNAL_DefragmentMemory(renderer, vulkanCommandBuffer))
@@ -10991,6 +11011,23 @@ static bool VULKAN_INTERNAL_DefragmentMemory(
     Sint32 indexToDefrag = -1;
     for (Sint32 i = renderer->allocationsToDefragCount - 1; i >= 0; i -= 1) {
         if (SDL_GetAtomicInt(&renderer->allocationsToDefrag[i]->referenceCount) == 0) {
+            if (CUO_Variant() == CUO_VAR_REFGUARD) {
+                VulkanMemoryAllocation *candidate = renderer->allocationsToDefrag[i];
+                bool referenced = false;
+                for (Uint32 r = 0; r < candidate->usedRegionCount && !referenced; r += 1) {
+                    VulkanMemoryUsedRegion *used = candidate->usedRegions[r];
+                    referenced = used->isBuffer ? SDL_GetAtomicInt(&used->vulkanBuffer->referenceCount) > 0
+                                                : SDL_GetAtomicInt(&used->vulkanTexture->referenceCount) > 0;
+                }
+                if (referenced) {
+                    static Uint32 skips = 0;
+                    skips += 1;
+                    if (skips <= 3 || (skips & (skips - 1)) == 0) {
+                        SDL_Log("SDL diag: refguard skipped allocation %p (%u MiB, %u used regions), skip #%u", (void *)candidate, (unsigned)(candidate->size >> 20), candidate->usedRegionCount, skips);
+                    }
+                    continue;
+                }
+            }
             indexToDefrag = i;
             break;
         }
@@ -11009,6 +11046,8 @@ static bool VULKAN_INTERNAL_DefragmentMemory(
         renderer->allocationsToDefrag[indexToDefrag] = renderer->allocationsToDefrag[renderer->allocationsToDefragCount - 1];
     }
     renderer->allocationsToDefragCount -= 1;
+
+    SDL_Log("SDL diag: defrag allocation %p (%u MiB, %u used regions, %u free regions)", (void *)allocation, (unsigned)(allocation->size >> 20), allocation->usedRegionCount, allocation->freeRegionCount);
 
     /* For each used region in the allocation
      * create a new resource, copy the data
@@ -11098,6 +11137,9 @@ static bool VULKAN_INTERNAL_DefragmentMemory(
             }
 
             SDL_GPUTextureCreateInfo info = currentRegion->vulkanTexture->container->header.info;
+            SDL_Log("SDL diag: defrag move texture %ux%ux%u fmt %d levels %u usage 0x%x %.2f MiB at +%.2f MiB, container %p",
+                    info.width, info.height, info.layer_count_or_depth, (int)info.format, info.num_levels, (unsigned)info.usage,
+                    currentRegion->resourceSize / 1048576.0, currentRegion->resourceOffset / 1048576.0, (void *)currentRegion->vulkanTexture->container);
 
             VULKAN_INTERNAL_TextureTransitionFromDefaultUsage(
                 renderer,
