@@ -2203,7 +2203,11 @@ static Uint8 VULKAN_INTERNAL_BindMemoryForImage(
             memoryTypesToTry[i],
             &memoryRequirements,
             memoryRequirements.size,
-            false,
+            /* Images of LARGE_ALLOCATION_INCREMENT or more get an allocation of exactly their size.
+             * Sub-allocated, such an image leaves a tail of up to 64 MiB that other resources share;
+             * their churn fragments the allocation and defragmentation then copies the whole image.
+             * A dedicated allocation has no free region, so it is never marked for defragmentation. */
+            memoryRequirements.size >= LARGE_ALLOCATION_INCREMENT,
             VK_NULL_HANDLE,
             image,
             usedRegion);
